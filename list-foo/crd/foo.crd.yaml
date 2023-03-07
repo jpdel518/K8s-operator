@@ -1,0 +1,29 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: foos.example.com # <spec.names.pluralと一致>.<spec.groupと一致>
+spec:
+  group: example.com
+  names:
+    kind: Foo #
+    plural: foos # コマンドラインで指定できる複数形の設定
+  scope: Namespaced # クラスターまたはネームスペースを指定する事ができる
+  versions: # 1つのカスタムリソースは複数のバージョンを持つ事ができるようになっている（配列で指定）
+    - name: v1alpha1 # 自由記載（<spec.group>/<spec.versions.name>の形でCRのapiVersionに指定）
+      served: true # served via REST APIs（kubectl getで取得したりとかAPIサーバ経由で操作できるようにするか）
+      storage: true # １つのCRDに対して１つのバージョンのみtrueになる
+      additionalPrinterColumns: # kubectl getで表示する際に表示するカラムを作成する事ができる
+        - name: Test String # 表示するカラム名
+          jsonPath: .testString # .はルートを表す（CR上でmetadataとかと同じ位置に定義されているtestStringを指定）
+          type: string
+        - name: Test Num
+          jsonPath: .testNum
+          type: integer
+      schema: # CR定義する際にmetadataと同列で記載するもの
+        openAPIV3Schema:
+          type: object
+          properties:
+            testString:
+              type: string
+            testNum:
+              type: integer
