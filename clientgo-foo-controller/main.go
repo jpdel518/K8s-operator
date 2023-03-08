@@ -1,14 +1,14 @@
 package main
 
 import (
-	"context"
 	"flag"
 	clientset "github.com/jpdel518/clientgo-foo-controller/pkg/generated/clientset/versioned"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	informers "github.com/jpdel518/clientgo-foo-controller/pkg/generated/informers/externalversions"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
 	"path/filepath"
+	"time"
 )
 
 func main() {
@@ -37,10 +37,24 @@ func main() {
 		klog.Fatalf("Error building example clientset: %s", err.Error())
 	}
 
-	// clientsetを使用してFooリソースをリストする(ExampleV1alpha1はグループバージョン)
-	foos, err := exampleClient.ExampleV1alpha1().Foos("").List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		klog.Fatalf("listing foos %s %s", err.Error())
+	// // clientsetを使用してFooリソースをリストする(ExampleV1alpha1はグループバージョン)
+	// foos, err := exampleClient.ExampleV1alpha1().Foos("").List(context.Background(), metav1.ListOptions{})
+	// if err != nil {
+	// 	klog.Fatalf("listing foos %s %s", err.Error())
+	// }
+	// klog.Infof("length of foos is %d", len(foos.Items))
+
+	// informerの作成
+	// informerはAPIサーバーをwatchしに行くのでclientsetが必要
+	// time.Second*30はinformerを30秒に一回resyncし直す
+	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
+	stopCh := make(chan struct{})
+	// controllerの作成
+	controller := NewController(exampleClient, exampleInformerFactory.Example().V1alpha1().Foos())
+	// informerのAPIサーバーのwatch開始
+	exampleInformerFactory.Start(stopCh)
+	// controllerの実行
+	if err = controller.Run(stopCh); err != nil {
+		klog.Fatalf("error occurred when running controller %s", err.Error())
 	}
-	klog.Infof("length of foos is %d", len(foos.Items))
 }
