@@ -204,6 +204,14 @@ func (c *Controller) syncHandler(key string) error {
 		return err
 	}
 
+	// Finally, we update the status block of the Foo resource to reflect the
+	// current state of the world
+	err = c.updateFooStatus(foo, deployment)
+	if err != nil {
+		klog.Errorf("failed to update Foo status for %s", foo.Name)
+		return err
+	}
+
 	return nil
 }
 
@@ -238,4 +246,18 @@ func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 			},
 		},
 	}
+}
+
+func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
+	// NEVER modify objects from the store. It's a read-only, local cache.
+	// fooオブジェクトを DeepCopy()する。DeepCopyはCode Generateで作成されたapis/example.com/v1alpha1/zz_generated_deepcopy.goに定義されている
+	fooCopy := foo.DeepCopy()
+	// fooオブジェクトのstatusにあるAvailableReplicasの更新
+	fooCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
+	// If the CustomResourceSubresources feature gate is not enabled,
+	// we must use Update instead of UpdateStatus to update the Status block of the Foo resource.
+	// UpdateStatus will not allow changes to the Spec of the resource,
+	// which is ideal for ensuring nothing other than resource status has been updated.
+	_, err := c.sampleClient.ExampleV1alpha1().Foos(foo.Namespace).UpdateStatus(context.TODO(), fooCopy, metav1.UpdateOptions{})
+	return err
 }
