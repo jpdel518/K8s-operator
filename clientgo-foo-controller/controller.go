@@ -21,6 +21,12 @@ import (
 	"time"
 )
 
+const (
+	// MessageResourceExists is the message used for Events when a resource
+	// fails to sync due to a Deployment already existing
+	MessageResourceExists = "Resource %q already exists and is not managed by Foo"
+)
+
 type Controller struct {
 	// 標準clientset
 	kubeclientset kubernetes.Interface
@@ -51,7 +57,10 @@ func NewController(
 
 	// Informerにイベントハンドラの登録
 	fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handleAdd,
+		AddFunc: controller.enqueueFoo,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			controller.enqueueFoo(newObj)
+		},
 		// DeleteFunc: controller.handleDelete,
 	})
 
@@ -174,6 +183,26 @@ func (c *Controller) syncHandler(key string) error {
 	}
 
 	klog.Infof("deployment %s is valid", deployment.Name)
+
+	// 対象のDeploymentがFooにコントロール（FooがオーナーのOwnerReferenceの関係にあるか）されているかどうかを確認
+	// 対象のDeploymentがFooにコントロールされてるものでない場合はエラーを返す
+	if !metav1.IsControlledBy(deployment, foo) {
+		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
+		klog.Info(msg)
+		return fmt.Errorf("%s", msg)
+	}
+
+	// FooのreplicasとDeploymentのreplicasを比較して、異なっている場合はkubectlientsetを使用してDeploymentを更新
+	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
+		klog.Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
+		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
+	}
+	// If an error occurs during Update, we'll requeue the item so we can
+	// attempt processing again later. This could have been caused by a
+	// temporary network failure, or any other transient reason.
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
