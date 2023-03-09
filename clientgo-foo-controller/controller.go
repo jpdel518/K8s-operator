@@ -64,6 +64,31 @@ func NewController(
 		// DeleteFunc: controller.handleDelete,
 	})
 
+	// Set up an event handler for when Deployment resources change. This
+	// handler will lookup the owner of the given Deployment, and if it is
+	// owned by a Foo resource then the handler will enqueue that Foo resource for
+	// processing. This way, we don't need to implement custom logic for
+	// handling Deployment resources. More info on this pattern:
+	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
+	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.handleObject,
+		UpdateFunc: func(old, new interface{}) {
+			// 渡されたobjectをDeploymentに変換
+			newDepl := new.(*appsv1.Deployment)
+			oldDepl := old.(*appsv1.Deployment)
+			// リソースバージョンが一緒だったらリターン、異なっていればhandleObjectを実行
+			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
+				// Resyncという仕組みを設定しているため、30秒に１回Update eventが呼ばれる
+				// Resyncでイベントが呼ばれた場合にはリソースの変更があったわけではない可能性がある
+				// リソースバージョンを見ることによって、実際に変更があったのか知ることができる
+				// 実際に変更があった場合のみ後続の処理を行う
+				return
+			}
+			controller.handleObject(new)
+		},
+		DeleteFunc: controller.handleObject,
+	})
+
 	return controller
 }
 
@@ -260,4 +285,50 @@ func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1
 	// which is ideal for ensuring nothing other than resource status has been updated.
 	_, err := c.sampleClient.ExampleV1alpha1().Foos(foo.Namespace).UpdateStatus(context.TODO(), fooCopy, metav1.UpdateOptions{})
 	return err
+}
+
+// handleObject will take any resource implementing metav1.Object and attempt
+// to find the Foo resource that 'owns' it. It does this by looking at the
+// objects metadata.ownerReferences field for an appropriate OwnerReference.
+// It then enqueues that Foo resource to be processed. If the object does not
+// have an appropriate OwnerReference, it will simply be skipped.
+func (c *Controller) handleObject(obj interface{}) {
+	var object metav1.Object
+	var ok bool
+	// metav1のオブジェクトに変換できなかった場合にはDeletedFinalStateUnknown（キーとオブジェクトを持っている）に変換する
+	// オブジェクトが削除された時に、Informerが持っているキャッシュの状態がわからなくなっていることがある
+	// （APIサーバーからDisconnectしている間に削除されたオブジェクトのFinalStateがわからなくなっているような状態）
+	// そのような場合にDeletedFinalStateUnknownに変換しようとする
+	// DeletedFinalStateUnknownに変換できた場合には、DeletedFinalStateUnknownのオブジェクトを取り出して、metav1のオブジェクトに変換する
+	// もし変換が可能であれば削除されたオブジェクトからリカバーした状態になる（objectに格納される）
+	if object, ok = obj.(metav1.Object); !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		object, ok = tombstone.Obj.(metav1.Object)
+		if !ok {
+			return
+		}
+		klog.Infof("Recovered deleted object '%s' from tombstone", object.GetName())
+	}
+	klog.Infof("Processing object: %s", object.GetName())
+	// objectのOwner Referenceを取得
+	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
+		// Owner ReferenceのKindがFooであるか確認
+		if ownerRef.Kind != "Foo" {
+			return
+		}
+
+		// FooListerを使って、対象となるNameとNameSpaceにFooオブジェクトが存在しているのか確認する
+		foo, err := c.foosLister.Foos(object.GetNamespace()).Get(ownerRef.Name)
+		if err != nil {
+			klog.Errorf("ignoring orphaned object '%s' of foo '%s'", object.GetSelfLink(), ownerRef.Name)
+			return
+		}
+
+		// 取得できたFooをenqueueする
+		c.enqueueFoo(foo)
+		return
+	}
 }
