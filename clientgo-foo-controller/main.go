@@ -4,6 +4,8 @@ import (
 	"flag"
 	clientset "github.com/jpdel518/clientgo-foo-controller/pkg/generated/clientset/versioned"
 	informers "github.com/jpdel518/clientgo-foo-controller/pkg/generated/informers/externalversions"
+	kubeinformers "k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
@@ -30,6 +32,11 @@ func main() {
 		klog.Fatalf("Error building kubeconfig: %s", err.Error())
 	}
 
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Fatalf("Getting kubernetes client set %s", err.Error())
+	}
+
 	// configを使用してclientsetを取得
 	// このclientsetはCode Generatorを使用して作成したFooリソースを扱うことのできるclientset
 	exampleClient, err := clientset.NewForConfig(config)
@@ -47,11 +54,17 @@ func main() {
 	// informerの作成
 	// informerはAPIサーバーをwatchしに行くのでclientsetが必要
 	// time.Second*30はinformerを30秒に一回resyncし直す
+	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
 	stopCh := make(chan struct{})
 	// controllerの作成
-	controller := NewController(exampleClient, exampleInformerFactory.Example().V1alpha1().Foos())
+	controller := NewController(
+		kubeClient,
+		exampleClient,
+		kubeInformerFactory.Apps().V1().Deployments(),
+		exampleInformerFactory.Example().V1alpha1().Foos())
 	// informerのAPIサーバーのwatch開始
+	kubeInformerFactory.Start(stopCh)
 	exampleInformerFactory.Start(stopCh)
 	// controllerの実行
 	if err = controller.Run(stopCh); err != nil {

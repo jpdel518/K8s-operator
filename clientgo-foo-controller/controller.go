@@ -1,11 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	samplev1alpha1 "github.com/jpdel518/clientgo-foo-controller/pkg/apis/example.com/v1alpha1"
 	clientset "github.com/jpdel518/clientgo-foo-controller/pkg/generated/clientset/versioned"
 	informers "github.com/jpdel518/clientgo-foo-controller/pkg/generated/informers/externalversions/example.com/v1alpha1"
 	listers "github.com/jpdel518/clientgo-foo-controller/pkg/generated/listers/example.com/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	appsinformers "k8s.io/client-go/informers/apps/v1"
+	"k8s.io/client-go/kubernetes"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -13,25 +22,37 @@ import (
 )
 
 type Controller struct {
-	sampleClient clientset.Interface
-	foosSynced   cache.InformerSynced // Informerの中にあるキャッシュがsyncされているかどうかを判定する関数
-	foosLister   listers.FooLister
-	workqueue    workqueue.RateLimitingInterface
+	// 標準clientset
+	kubeclientset kubernetes.Interface
+	// カスタムリソース用のclientset
+	sampleClient     clientset.Interface
+	deploymentSynced cache.InformerSynced
+	deploymentLister appslisters.DeploymentLister
+	foosSynced       cache.InformerSynced // Informerの中にあるキャッシュがsyncされているかどうかを判定する関数
+	foosLister       listers.FooLister
+	workqueue        workqueue.RateLimitingInterface
 }
 
-func NewController(sampleClient clientset.Interface, fooInformer informers.FooInformer) *Controller {
+func NewController(
+	kubeclientset kubernetes.Interface,
+	sampleClient clientset.Interface,
+	deploymentInformer appsinformers.DeploymentInformer,
+	fooInformer informers.FooInformer) *Controller {
 	// コントローラーの初期化
 	controller := &Controller{
-		sampleClient: sampleClient,
-		foosSynced:   fooInformer.Informer().HasSynced,
-		foosLister:   fooInformer.Lister(),
-		workqueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "foo"),
+		kubeclientset:    kubeclientset,
+		sampleClient:     sampleClient,
+		deploymentSynced: deploymentInformer.Informer().HasSynced,
+		deploymentLister: deploymentInformer.Lister(),
+		foosSynced:       fooInformer.Informer().HasSynced,
+		foosLister:       fooInformer.Lister(),
+		workqueue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "foo"),
 	}
 
 	// Informerにイベントハンドラの登録
 	fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    controller.handleAdd,
-		DeleteFunc: controller.handleDelete,
+		AddFunc: controller.handleAdd,
+		// DeleteFunc: controller.handleDelete,
 	})
 
 	return controller
@@ -61,10 +82,10 @@ func (c *Controller) handleAdd(obj interface{}) {
 	c.enqueueFoo(obj)
 }
 
-func (c *Controller) handleDelete(obj interface{}) {
-	klog.Info("handleDelete is called")
-	c.enqueueFoo(obj)
-}
+// func (c *Controller) handleDelete(obj interface{}) {
+// 	klog.Info("handleDelete is called")
+// 	c.enqueueFoo(obj)
+// }
 
 func (c *Controller) enqueueFoo(obj interface{}) {
 	var key string
@@ -99,21 +120,11 @@ func (c *Controller) processNextWorkItem() bool {
 			return nil
 		}
 
-		// keyはnameとnamespaceからなっているので、splitして切り分ける
-		ns, name, err := cache.SplitMetaNamespaceKey(key)
-		if err != nil {
-			klog.Errorf("failed to split key into namespace and name %s", err.Error())
-			return err
+		if err := c.syncHandler(key); err != nil {
+			// RateLimitがOKって言った時にqueueにアイテムを戻す（時間を置いて再度処理する）
+			c.workqueue.AddRateLimited(key)
+			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
 		}
-
-		// foosListerを使ってFooを取得する
-		foo, err := c.foosLister.Foos(ns).Get(name)
-		if err != nil {
-			klog.Errorf("failed to get foo resource from lister %s", err.Error())
-			return err
-		}
-		// 取得できたFooのSpecをログに出力
-		klog.Infof("Got foo %+v", foo.Spec)
 
 		// requeueされないようにqueueの中から対象のobjを削除する
 		c.workqueue.Forget(obj)
@@ -128,4 +139,74 @@ func (c *Controller) processNextWorkItem() bool {
 	}
 
 	return true
+}
+
+func (c *Controller) syncHandler(key string) error {
+	// keyはnameとnamespaceからなっているので、splitして切り分ける
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		klog.Errorf("failed to split key into namespace and name %s", err.Error())
+		return err
+	}
+
+	// foosListerを使ってFooを取得する
+	foo, err := c.foosLister.Foos(ns).Get(name)
+	if err != nil {
+		klog.Errorf("failed to get foo resource from lister %s", err.Error())
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	deploymentName := foo.Spec.DeploymentName
+	if deploymentName == "" {
+		klog.Errorf("deploymentName must be specified %s", key)
+		return nil
+	}
+	deployment, err := c.deploymentLister.Deployments(foo.Namespace).Get(deploymentName)
+	if errors.IsNotFound(err) {
+		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
+	}
+
+	if err != nil {
+		return err
+	}
+
+	klog.Infof("deployment %s is valid", deployment.Name)
+
+	return nil
+}
+
+func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
+	labels := map[string]string{
+		"app":        "nginx",
+		"controller": foo.Name,
+	}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            foo.Spec.DeploymentName,
+			Namespace:       foo.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(foo, samplev1alpha1.SchemeGroupVersion.WithKind("Foo"))},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: foo.Spec.Replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "nginx",
+							Image: "nginx:latest",
+						},
+					},
+				},
+			},
+		},
+	}
 }
