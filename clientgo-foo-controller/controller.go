@@ -5,6 +5,7 @@ import (
 	"fmt"
 	samplev1alpha1 "github.com/jpdel518/clientgo-foo-controller/pkg/apis/example.com/v1alpha1"
 	clientset "github.com/jpdel518/clientgo-foo-controller/pkg/generated/clientset/versioned"
+	"github.com/jpdel518/clientgo-foo-controller/pkg/generated/clientset/versioned/scheme"
 	informers "github.com/jpdel518/clientgo-foo-controller/pkg/generated/informers/externalversions/example.com/v1alpha1"
 	listers "github.com/jpdel518/clientgo-foo-controller/pkg/generated/listers/example.com/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -14,29 +15,41 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	"k8s.io/client-go/kubernetes"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"time"
 )
 
+const controllerAgentName = "clientgo-foo-controller"
+
 const (
+	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
+	SuccessSynced = "Synced"
+	// ErrResourceExists is used as part of the Event 'reason' when a Foo fails
+	// to sync due to a Deployment of the same name already existing.
+	ErrResourceExists = "ErrResourceExists"
+
 	// MessageResourceExists is the message used for Events when a resource
 	// fails to sync due to a Deployment already existing
 	MessageResourceExists = "Resource %q already exists and is not managed by Foo"
+	// MessageResourceSynced is the message used for an Event fired when a Foo
+	// is synced successfully
+	MessageResourceSynced = "Foo synced successfully"
 )
 
 type Controller struct {
-	// 標準clientset
-	kubeclientset kubernetes.Interface
-	// カスタムリソース用のclientset
-	sampleClient     clientset.Interface
+	kubeclientset    kubernetes.Interface // 標準clientset
+	sampleClient     clientset.Interface  // カスタムリソース用のclientset
 	deploymentSynced cache.InformerSynced
 	deploymentLister appslisters.DeploymentLister
 	foosSynced       cache.InformerSynced // Informerの中にあるキャッシュがsyncされているかどうかを判定する関数
 	foosLister       listers.FooLister
 	workqueue        workqueue.RateLimitingInterface
+	recorder         record.EventRecorder // EventRecorderはEventリソースをKubernetesAPIサーバーに記録するためのもの
 }
 
 func NewController(
@@ -44,6 +57,11 @@ func NewController(
 	sampleClient clientset.Interface,
 	deploymentInformer appsinformers.DeploymentInformer,
 	fooInformer informers.FooInformer) *Controller {
+
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartStructuredLogging(0)
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 	// コントローラーの初期化
 	controller := &Controller{
 		kubeclientset:    kubeclientset,
@@ -53,6 +71,7 @@ func NewController(
 		foosSynced:       fooInformer.Informer().HasSynced,
 		foosLister:       fooInformer.Lister(),
 		workqueue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "foo"),
+		recorder:         recorder,
 	}
 
 	// Informerにイベントハンドラの登録
@@ -111,16 +130,17 @@ func (c *Controller) runWorker() {
 
 }
 
-func (c *Controller) handleAdd(obj interface{}) {
-	klog.Info("handleAdd is called")
-	c.enqueueFoo(obj)
-}
+// func (c *Controller) handleAdd(obj interface{}) {
+// 	klog.Info("handleAdd is called")
+// 	c.enqueueFoo(obj)
+// }
 
 // func (c *Controller) handleDelete(obj interface{}) {
 // 	klog.Info("handleDelete is called")
 // 	c.enqueueFoo(obj)
 // }
 
+// workqueueにobjを追加
 func (c *Controller) enqueueFoo(obj interface{}) {
 	var key string
 	var err error
@@ -132,6 +152,7 @@ func (c *Controller) enqueueFoo(obj interface{}) {
 	c.workqueue.Add(key)
 }
 
+// workqueueからアイテムを取り出して順次処理
 func (c *Controller) processNextWorkItem() bool {
 	// workqueueがシャットダウン状態であれば終了
 	obj, shutdown := c.workqueue.Get()
@@ -175,6 +196,7 @@ func (c *Controller) processNextWorkItem() bool {
 	return true
 }
 
+// FooとDeploymentのsyncを行う
 func (c *Controller) syncHandler(key string) error {
 	// keyはnameとnamespaceからなっているので、splitして切り分ける
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
@@ -213,6 +235,7 @@ func (c *Controller) syncHandler(key string) error {
 	// 対象のDeploymentがFooにコントロールされてるものでない場合はエラーを返す
 	if !metav1.IsControlledBy(deployment, foo) {
 		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
+		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
 		klog.Info(msg)
 		return fmt.Errorf("%s", msg)
 	}
@@ -237,9 +260,12 @@ func (c *Controller) syncHandler(key string) error {
 		return err
 	}
 
+	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
 	return nil
 }
 
+// FooのName,Namespace,Spec.Replicasにマッチしたappsv1.Deploymentの作成
+// storeからdeploymentを取得できても直接編集することはできないので、こういったappsv1.Deploymentの作成を介してkubeclientsetにお願いする
 func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 	labels := map[string]string{
 		"app":        "nginx",
@@ -273,6 +299,7 @@ func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 	}
 }
 
+// FooのStatus更新
 func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
 	// NEVER modify objects from the store. It's a read-only, local cache.
 	// fooオブジェクトを DeepCopy()する。DeepCopyはCode Generateで作成されたapis/example.com/v1alpha1/zz_generated_deepcopy.goに定義されている
